@@ -1,0 +1,25 @@
+title: Acronis Cyber Protect Cloud: Backup of a machine
+agents: acronis_backup
+catalog: cloud/acronis
+license: GPLv2
+distribution: none
+description:
+ This check reports whether the Acronis backup of a machine ran cleanly. The
+ data is fetched by the special agent {agent_acronis_backup} from the Acronis
+ Cyber Protect Cloud API and assigned to the machines as piggyback data.
+
+ The check is {OK} if a backup plan is applied, the last successful backup is
+ not older than the configured levels (default: 36 hours / 3 days) and the
+ most recent finished run of every backup plan ended without warnings. Runs
+ of application backups (SQL, Exchange) count for the machine of the agent.
+ Several Acronis resources with the same host name, for example a server
+ that is registered with an agent and as a virtual machine, are combined.
+
+ It is {WARN} if the most recent run finished with warnings or was cancelled,
+ and {CRIT} if it failed, was abandoned or timed out, if there never was a
+ successful backup, or if no backup plan is applied to the machine any more.
+ These states can be changed with the rule {Acronis backup}, which also
+ holds the settings of the service {Acronis Backup Summary}.
+
+discovery:
+ One service is created for each machine that has a backup plan applied.
