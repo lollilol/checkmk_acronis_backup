@@ -72,7 +72,7 @@ Enabling a new version replaces the old one; existing rules stay.
      longest gap between two scheduled runs.
    - *Remove these domains from the machine names*: e.g. `example.local`.
    - **Conditions → Explicit hosts: exactly one host.** A rule without this condition
-     applies to every host, and every host then queries Acronis instead of its own agent.
+     applies to every host, and every host then queries Acronis instead of its own agent. I recommend just using the checkmk server itself.
 3. **The host the rule runs on:**
    - a dedicated host, e.g. `acronis`, with *IP address family* set to **No IP**, **or**
    - an existing host such as the Checkmk server itself. Then set Properties → Monitoring
