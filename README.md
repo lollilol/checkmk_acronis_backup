@@ -1,6 +1,6 @@
 # Acronis Cyber Protect Cloud – Checkmk plugin
 
-Version 1.4.0 · Checkmk 2.5.0 or later (Community Edition and up) · package name `acronis_backup`
+Version 1.4.1 · Checkmk 2.5.0 or later (Community Edition and up) · package name `acronis_backup`
 
 Checks per machine whether the Acronis backup ran cleanly. A special agent reads the
 Acronis Cyber Protect Cloud API and hands the data to the matching Checkmk hosts as
@@ -52,11 +52,11 @@ Copy the package to the Checkmk server so that the site user can read it, then a
 user:
 
 ```
-mkp add /tmp/acronis_backup-1.4.0.mkp
-mkp enable acronis_backup 1.4.0
+mkp add /tmp/acronis_backup-1.4.1.mkp
+mkp enable acronis_backup 1.4.1
 ```
 
-`mkp add` prints `acronis_backup 1.4.0` on success. If it prints nothing, the file is not
+`mkp add` prints `acronis_backup 1.4.1` on success. If it prints nothing, the file is not
 readable for the site user (`chmod 644`), or run `mkp -d add …` to see the error.
 
 Enabling a new version replaces the old one; existing rules stay.
@@ -140,6 +140,7 @@ As the site user:
 | `--strip-domain D` | remove domain D from machine names, repeatable |
 | `--keep-case` | do not lower-case the names |
 | `--no-token-cache` | request a new access token on every run |
+| `--max-cache-age S` | on API errors, output the last good result up to S seconds old (default 1800, `0` disables) |
 | `-v` | number of machines, activities and backup runs to stderr |
 | `--debug` | show tracebacks |
 
@@ -157,6 +158,14 @@ for tests. Checkmk itself passes a reference to the password store.
   newest first. One run of a plan is one task with many activities; the result for a
   machine is the worst result of the activities of that run that belong to it. Runs still
   in progress are skipped.
+- Rate limiting: HTTP 429 and 502/503/504 are retried up to three times per request,
+  waiting as long as `Retry-After` says (otherwise 5, 10, 20 s). All waiting of one run
+  together is limited to 30 s so the agent stays within the fetcher timeout.
+- Output cache: the output of every successful run is stored next to the token. If a run
+  fails (e.g. still rate limited), the last good output is printed again with the
+  `cached(<time>,<max age>)` option on every section, as long as it is not older than
+  `--max-cache-age`. The services then show the age of the data instead of going stale;
+  after that, the error is reported as before.
 - Paging uses the cursor of the API; the first request carries the filters, later ones only
   `limit` and `after`.
 
@@ -185,6 +194,8 @@ cmk_addons/plugins/acronis/
 
 ## Changelog
 
+- **1.4.1** – Retries on HTTP 429 / 5xx honouring `Retry-After`; on API errors the last
+  good result (max. 30 min old) is used, marked as cached, instead of failing the run.
 - **1.4.0** – Thresholds rule split into two blocks, settings shown below each other.
   Rules from 1.3.x are migrated.
 - **1.3.0** – One rule for both services; minimum / maximum number of machines with and

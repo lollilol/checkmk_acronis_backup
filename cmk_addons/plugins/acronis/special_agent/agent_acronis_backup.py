@@ -9,6 +9,7 @@ data, one section per machine.
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime, UTC
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -23,7 +25,7 @@ import requests
 from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
 from cmk.server_side_programs.v1_unstable import report_agent_crashes, Storage
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 AGENT = "acronis_backup"
 USER_AGENT = f"checkmk-special-{AGENT}-{__version__}"
@@ -34,6 +36,19 @@ RESOURCE_PAGE_SIZE = 200
 ACTIVITY_PAGE_SIZE = 500
 MAX_PAGES = 100  # hard stop against endless paging
 TOKEN_MIN_REMAINING = 300  # seconds a cached token must still be valid
+
+# Rate limiting (HTTP 429) and temporary server errors are retried, honouring
+# Retry-After. All waiting of one run together stays below RETRY_BUDGET so the
+# agent finishes well within the timeout of the Checkmk fetcher.
+RETRY_STATUS = frozenset({429, 502, 503, 504})
+MAX_RETRIES = 3  # per request
+RETRY_BUDGET = 30.0  # seconds of waiting per run
+RETRY_DEFAULT_DELAY = 5.0  # seconds, doubled per attempt, when Retry-After is missing
+
+# The last good output is kept and handed out again (marked as cached) when the
+# API cannot be read, so one failed run does not turn the services stale.
+OUTPUT_CACHE_KEY = "output"
+DEFAULT_MAX_CACHE_AGE = 1800  # seconds
 
 # Resources that are machines in the sense of the Acronis console ("Devices").
 MACHINE_TYPE_PREFIXES = ("resource.machine", "resource.virtual_machine")
@@ -90,6 +105,14 @@ def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Request a new access token on every run",
     )
+    parser.add_argument(
+        "--max-cache-age",
+        type=int,
+        default=DEFAULT_MAX_CACHE_AGE,
+        metavar="SECONDS",
+        help="If the API cannot be read, output the last good result if it is not older "
+        f"than this, marked as cached (default: {DEFAULT_MAX_CACHE_AGE}, 0 disables)",
+    )
     return parser.parse_args(argv)
 
 
@@ -106,6 +129,23 @@ class AcronisAPI:
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
         self._token_is_cached = False
+        self._retry_budget = RETRY_BUDGET
+
+    def _send(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        """One HTTP request, retried on rate limiting and temporary server errors."""
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = self._session.request(method, url, timeout=TIMEOUT, **kwargs)
+            except requests.RequestException as exc:
+                raise AcronisError(f"Cannot reach Acronis ({url}): {exc}") from exc
+            if response.status_code not in RETRY_STATUS or attempt == MAX_RETRIES:
+                return response
+            delay = _retry_delay(response, attempt)
+            if delay > self._retry_budget:
+                return response  # waiting longer would risk the fetcher timeout
+            self._retry_budget -= delay
+            time.sleep(delay)
+        return response  # not reached, keeps type checkers happy
 
     # Acronis asks integrations to reuse the access token (valid for two hours)
     # instead of issuing a new one for every sequence of calls.
@@ -151,15 +191,12 @@ class AcronisAPI:
         self._session.headers["Authorization"] = f"Bearer {token}"
 
     def _request_token(self) -> str:
-        try:
-            response = self._session.post(
-                f"{self._base}/2/idp/token",
-                auth=(self._client_id, self._client_secret),
-                data={"grant_type": "client_credentials"},
-                timeout=TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            raise AcronisError(f"Cannot reach Acronis ({self._base}): {exc}") from exc
+        response = self._send(
+            "POST",
+            f"{self._base}/2/idp/token",
+            auth=(self._client_id, self._client_secret),
+            data={"grant_type": "client_credentials"},
+        )
         if response.status_code != 200:
             raise AcronisError(
                 f"Acronis login failed (HTTP {response.status_code}): {_shorten(response.text)}"
@@ -171,10 +208,7 @@ class AcronisAPI:
 
     def _get(self, path: str, params: Mapping[str, str | int]) -> JSON:
         for attempt in (1, 2):
-            try:
-                response = self._session.get(f"{self._base}{path}", params=params, timeout=TIMEOUT)
-            except requests.RequestException as exc:
-                raise AcronisError(f"Request to {path} failed: {exc}") from exc
+            response = self._send("GET", f"{self._base}{path}", params=params)
             # A cached token may have been revoked: get a fresh one once.
             if response.status_code == 401 and self._token_is_cached and attempt == 1:
                 self.login(force=True)
@@ -224,6 +258,22 @@ class AcronisAPI:
 
 # .
 #   .--helpers-------------------------------------------------------------.
+
+
+def _retry_delay(response: requests.Response, attempt: int) -> float:
+    """Seconds to wait before the next attempt: Retry-After (seconds or HTTP date)
+    if the server sends it, otherwise exponential backoff."""
+    value = response.headers.get("Retry-After", "").strip()
+    if value:
+        try:
+            return max(1.0, float(value))
+        except ValueError:
+            pass
+        try:
+            return max(1.0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError, IndexError, OverflowError):
+            pass
+    return RETRY_DEFAULT_DELAY * 2**attempt
 
 
 def _shorten(text: object, length: int = MESSAGE_MAX_LENGTH) -> str:
@@ -408,12 +458,12 @@ def collect(api: AcronisAPI, since: float) -> tuple[list[dict[str, Any]], dict[s
     return machines, statistics
 
 
-def write_sections(
+def render_sections(
     machines: Sequence[Mapping[str, Any]],
     statistics: Mapping[str, Any],
     args: argparse.Namespace,
-) -> None:
-    out = sys.stdout
+) -> str:
+    out = io.StringIO()
     by_host: dict[str, list[Mapping[str, Any]]] = {}
     for machine in machines:
         host = piggyback_name(
@@ -437,19 +487,55 @@ def write_sections(
         for machine in host_machines:
             out.write(json.dumps(machine, sort_keys=True) + "\n")
         out.write("<<<<>>>>\n")
+    return out.getvalue()
+
+
+# .
+#   .--output cache--------------------------------------------------------.
+
+# Section headers, but not the piggyback headers <<<<host>>>> / <<<<>>>>.
+_SECTION_HEADER = re.compile(r"^<<<(?!<)(.+)>>>$", re.MULTILINE)
+
+
+def mark_cached(output: str, created: float, max_age: int) -> str:
+    """Add the cached(...) option to every section header, so Checkmk shows the
+    age of the data and treats it as stale once it is older than max_age."""
+    option = f":cached({int(created)},{max_age})"
+    return _SECTION_HEADER.sub(lambda m: f"<<<{m.group(1)}{option}>>>", output)
+
+
+def write_output_cache(storage: Storage, output: str) -> None:
+    try:
+        storage.write(OUTPUT_CACHE_KEY, json.dumps({"created": time.time(), "output": output}))
+    except (RuntimeError, OSError) as exc:
+        sys.stderr.write(f"Cannot write output cache: {exc}\n")  # optimization only
+
+
+def read_output_cache(storage: Storage, max_age: int) -> str | None:
+    """The last good output, marked as cached, if it is not older than max_age."""
+    if max_age <= 0:
+        return None
+    try:
+        cached = json.loads(storage.read(OUTPUT_CACHE_KEY, "{}"))
+        created, output = float(cached["created"]), str(cached["output"])
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+        return None
+    if not 0 <= time.time() - created <= max_age:
+        return None
+    return mark_cached(output, created, max_age)
 
 
 # .
 
 
 def agent_acronis_backup_main(args: argparse.Namespace) -> int:
-    os.umask(0o077)  # the token cache must not be readable by others
-    storage = None if args.no_token_cache else Storage(AGENT, args.hostname)
+    os.umask(0o077)  # token and output cache must not be readable by others
+    storage = Storage(AGENT, args.hostname)
     api = AcronisAPI(
         args.url,
         args.client_id,
         resolve_secret_option(args, SECRET_OPTION.replace("-", "_")).reveal(),
-        storage,
+        None if args.no_token_cache else storage,
     )
     try:
         api.login()
@@ -458,14 +544,22 @@ def agent_acronis_backup_main(args: argparse.Namespace) -> int:
         if args.debug:
             raise
         sys.stderr.write(f"{exc}\n")
-        return 1
+        if (cached := read_output_cache(storage, args.max_cache_age)) is None:
+            return 1
+        # A temporary failure (e.g. rate limiting): hand out the last good data,
+        # its age is shown in the services.
+        sys.stdout.write(cached)
+        return 0
 
     if args.verbose:
         sys.stderr.write(
             f"{len(machines)} machines, {statistics['activities']} finished activities in the "
             f"last {args.lookback_hours} h, {statistics['backup_runs']} finished backup runs\n"
         )
-    write_sections(machines, statistics, args)
+    output = render_sections(machines, statistics, args)
+    if args.max_cache_age > 0:
+        write_output_cache(storage, output)
+    sys.stdout.write(output)
     return 0
 
 
